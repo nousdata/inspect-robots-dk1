@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -108,6 +109,41 @@ def parse_camera_devices(spec: str | None) -> dict[str, int | str]:
     return devices
 
 
+def parse_start_joints(spec: str | Sequence[float] | None) -> tuple[float, ...] | None:
+    """Parse ``"0.0,1.03,1.31,-1.83,0.0,-0.02"`` into six arm-joint targets in radians.
+
+    Accepts the CLI's comma-separated string (``-E start_joints=...``) or a
+    Python sequence of six floats (``joint_1..joint_6``; the gripper is not
+    part of the start pose). ``None`` or an empty string means no start pose.
+    A wrong length, a non-numeric entry, or a non-finite value is a ValueError.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        if not spec.strip():
+            return None
+        items: list[Any] = [item.strip() for item in spec.split(",")]
+    elif isinstance(spec, (int, float)):
+        raise ValueError(
+            f"start_joints must be {NUM_JOINTS} comma-separated radians "
+            f"(joint_1..joint_{NUM_JOINTS}), got the single value {spec!r}"
+        )
+    else:
+        items = list(spec)
+    if len(items) != NUM_JOINTS:
+        raise ValueError(
+            f"start_joints must have {NUM_JOINTS} entries (joint_1..joint_{NUM_JOINTS}), "
+            f"got {len(items)}: {spec!r}"
+        )
+    try:
+        values = tuple(float(v) for v in items)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"start_joints entries must be numbers (radians), got {spec!r}") from exc
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError(f"start_joints must contain finite numbers, got {spec!r}")
+    return values
+
+
 @dataclass(frozen=True)
 class DK1Config(_FromKwargs):
     """Static configuration for a single TRLC-DK1 follower embodiment."""
@@ -134,6 +170,12 @@ class DK1Config(_FromKwargs):
     joint_low: tuple[float, ...] = JOINT_LOW
     joint_high: tuple[float, ...] = JOINT_HIGH
     home_pose: tuple[float, ...] | None = None
+    # Six arm-joint targets (radians) the arm glides to at every reset, right
+    # after the driver connects and before the operator readiness prompt, in
+    # open-loop steps of ``max_relative_target``. CLI-settable as a
+    # comma-separated string ("0.0,1.03,1.31,-1.83,0.0,-0.02"); a 6-tuple in
+    # Python. The gripper is left where it is. None (default) skips the glide.
+    start_joints: str | tuple[float, ...] | None = None
     joints_are_delta: bool = False
     # Radians per step for the arm joints; None disables the embodiment's slew
     # limit (the CLI's default guardrails still apply their own).
@@ -180,6 +222,20 @@ class DK1Config(_FromKwargs):
                 "jump to the home pose; set DK1Config.max_relative_target (radians "
                 "per step) to slew-limit it, or unset home_pose"
             )
+        start = parse_start_joints(self.start_joints)
+        if start is not None:
+            if self.max_relative_target is None:
+                raise ValueError(
+                    "start_joints without max_relative_target would command a full-speed "
+                    "jump to the start pose; set DK1Config.max_relative_target (radians "
+                    "per step) to slew-limit it, or unset start_joints"
+                )
+            sj = np.asarray(start, dtype=np.float64)
+            if np.any(sj < self.low[:NUM_JOINTS]) or np.any(sj > self.high[:NUM_JOINTS]):
+                raise ValueError(
+                    f"start_joints {start} is outside [joint_low, joint_high] for the arm "
+                    "joints; the clamp would keep the glide from ever reaching it"
+                )
         if self.camera_rotation not in VALID_CAMERA_ROTATIONS:
             raise ValueError(
                 f"camera_rotation must be one of {VALID_CAMERA_ROTATIONS}, "

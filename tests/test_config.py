@@ -19,6 +19,7 @@ from inspect_robots_dk1.config import (
     action_semantics,
     camera_specs,
     parse_camera_devices,
+    parse_start_joints,
 )
 
 
@@ -197,6 +198,78 @@ def test_parse_camera_devices_rejects_malformed(spec: str) -> None:
 def test_parse_camera_devices_rejects_duplicates() -> None:
     with pytest.raises(ValueError, match="twice"):
         parse_camera_devices("wrist=1,wrist=2")
+
+
+CLI_START = "0.0,1.03,1.31,-1.83,0.0,-0.02"
+START = (0.0, 1.03, 1.31, -1.83, 0.0, -0.02)
+# The same pose with joint_4 inside the default joint box (its floor is -1.665 rad).
+CLI_START_IN_BOX = "0.0,1.03,1.31,-1.6,0.0,-0.02"
+
+
+@pytest.mark.parametrize("spec", [None, "", "   "])
+def test_parse_start_joints_empty(spec: str | None) -> None:
+    assert parse_start_joints(spec) is None
+
+
+def test_parse_start_joints_cli_string_round_trips() -> None:
+    out = parse_start_joints(CLI_START)
+    assert out == pytest.approx(START)
+    assert isinstance(out, tuple) and all(isinstance(v, float) for v in out)
+    assert parse_start_joints(" 0.0, 1.03 ,1.31,-1.83,0.0,-0.02 ") == pytest.approx(START)
+
+
+def test_parse_start_joints_accepts_python_sequences() -> None:
+    assert parse_start_joints(START) == pytest.approx(START)
+    assert parse_start_joints(list(START)) == pytest.approx(START)
+    assert parse_start_joints(np.asarray(START)) == pytest.approx(START)
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ("0.0,1.03", "start_joints must have 6 entries .* got 2"),
+        ("0.0,1.03,1.31,-1.83,0.0,-0.02,0.5", "start_joints must have 6 entries .* got 7"),
+        ((0.0,) * 7, "start_joints must have 6 entries .* got 7"),
+        ("0.0,1.03,1.31,-1.83,0.0,", "start_joints entries must be numbers"),
+        ("a,b,c,d,e,f", "start_joints entries must be numbers"),
+        ("0.0,nan,1.31,-1.83,0.0,-0.02", "start_joints must contain finite numbers"),
+        ((0.0, 1.0, 1.0, float("inf"), 0.0, 0.0), "start_joints must contain finite numbers"),
+        (1.0, "start_joints must be 6 comma-separated radians .* got the single value 1.0"),
+    ],
+)
+def test_parse_start_joints_rejects_bad_input(spec: object, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_start_joints(spec)  # type: ignore[arg-type]
+
+
+def test_dk1_from_kwargs_accepts_cli_start_joints() -> None:
+    cfg = DK1Config.from_kwargs(start_joints=CLI_START_IN_BOX)
+    assert cfg.start_joints == CLI_START_IN_BOX  # stored raw, like camera_devices
+    assert parse_start_joints(cfg.start_joints) == pytest.approx(
+        (0.0, 1.03, 1.31, -1.6, 0.0, -0.02)
+    )
+    assert DK1Config().start_joints is None
+
+
+def test_dk1_accepts_raised_start_pose_once_joint_4_floor_is_widened() -> None:
+    # joint_4 = -1.83 rad sits below the default floor (-100 deg pos_vel clip + 0.08);
+    # the impedance-mode library limit is -111.7 deg, so a Python config can widen it.
+    low = list(JOINT_LOW)
+    low[3] = -1.95 + 0.08
+    cfg = DK1Config(start_joints=CLI_START, joint_low=tuple(low))
+    assert parse_start_joints(cfg.start_joints) == pytest.approx(START)
+
+
+def test_dk1_rejects_bad_start_joints() -> None:
+    with pytest.raises(ValueError, match="start_joints must have 6 entries"):
+        DK1Config(start_joints="0.0,1.03")
+    with pytest.raises(ValueError, match="outside \\[joint_low, joint_high\\] for the arm"):
+        DK1Config(start_joints="0.0,10.0,1.31,-1.6,0.0,-0.02")
+    # The raised example pose itself: joint_4 -1.83 is below the default floor.
+    with pytest.raises(ValueError, match="outside \\[joint_low, joint_high\\] for the arm"):
+        DK1Config(start_joints=CLI_START)
+    with pytest.raises(ValueError, match="full-speed jump to the start pose"):
+        DK1Config(start_joints=CLI_START_IN_BOX, max_relative_target=None)
 
 
 def test_action_semantics_labels_every_dim() -> None:

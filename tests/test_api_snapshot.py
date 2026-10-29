@@ -12,6 +12,9 @@ EXPECTED_API = {
     "TOTAL_DIM",
     "DK1Config",
     "DK1Embodiment",
+    "DreamAPIError",
+    "DreamPolicy",
+    "DreamPolicyConfig",
     "LeRobotPolicy",
     "LeRobotPolicyConfig",
     "OperatorIO",
@@ -42,3 +45,4 @@ def test_entry_points_resolve_via_registry() -> None:
     emb = resolve("embodiment", "dk1")
     assert pol.info.name == "lerobot"
     assert emb.info.name == "dk1"
+    assert resolve("policy", "dream").info.name == "dream"

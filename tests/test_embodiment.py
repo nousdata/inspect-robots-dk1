@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import numpy as np
 import pytest
 from inspect_robots.embodiment import SELF_PACED
+from inspect_robots.errors import EmbodimentFault
 from inspect_robots.scene import Scene
 from inspect_robots.types import OPERATOR_END, Action
 
@@ -149,6 +151,173 @@ def test_reset_without_home_pose_issues_no_command() -> None:
     emb, drv, _ = _build()
     emb.reset(Scene(id="s", instruction="x"))
     assert drv.commands == []
+
+
+# -- start_joints glide -------------------------------------------------------
+
+# joint_4 at -1.6 rad keeps this inside the default joint box (its floor is -1.665).
+CLI_START = "0.0,1.03,1.31,-1.6,0.0,-0.02"
+
+STEP = 1.0 / 30.0  # one control period at the default control_hz
+
+
+class StuckDriver(FakeDriver):
+    """Accepts and echoes every command but the motors never move."""
+
+    def __init__(self, state: np.ndarray) -> None:
+        super().__init__(state=state)
+        self._stuck = np.asarray(state, dtype=float).copy()
+
+    def send_action(self, action: dict[str, float]) -> dict[str, float]:
+        accepted = FakeDriver.send_action(self, action)
+        self.state = self._stuck.copy()
+        return accepted
+
+
+class SaggingDriver(FakeDriver):
+    """Arm joints settle ``sag`` rad short of every command, in the direction they moved.
+
+    This is the real impedance-mode wrist: a soft gain under gravity load. A
+    closed-loop glide (observed + at most max_relative_target) stalls against
+    it as soon as ``sag`` equals the step size, because each command re-sends
+    the pose the motor just sagged back from.
+    """
+
+    def __init__(self, sag: float) -> None:
+        super().__init__()
+        self._sag = sag
+
+    def send_action(self, action: dict[str, float]) -> dict[str, float]:
+        before = self.state.copy()
+        echo = FakeDriver.send_action(self, action)
+        accepted = self.commands[-1]
+        moved = np.sign(accepted[:6] - before[:6])
+        self.state[:6] = accepted[:6] - self._sag * moved
+        return echo
+
+
+def test_reset_with_default_start_joints_does_not_glide() -> None:
+    emb, drv, sleeps = _build(DK1Config(start_joints=None))
+    emb.reset(Scene(id="s", instruction="x"))
+    assert drv.commands == []
+    assert drv.observation_reads == 1  # only the reset observation
+    assert sleeps == []
+
+
+def test_start_joints_glide_sends_the_planned_wrist_steps_then_the_arm_steps() -> None:
+    """Phase 1 is joint_4's 3-step plan, phase 2 is joint_1's 5-step plan, exact values."""
+    start = np.array([0.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.3])  # gripper part-closed
+    cfg = DK1Config(start_joints=(0.5, 0.2, 0.0, -0.25, 0.0, 0.0), max_relative_target=0.1)
+    emb, drv, sleeps = _build(cfg, driver=FakeDriver(state=start))
+    emb.reset(Scene(id="s", instruction="x"))
+
+    commands = np.stack(drv.commands)
+    assert len(commands) == 3 + 5  # ceil(0.25 / 0.1) wrist steps, then ceil(0.5 / 0.1) arm steps
+    # Phase 1: joint_4 steps -0.1, -0.2, -0.25 while joint_1..joint_3 hold their observed pose.
+    assert commands[:3, 3] == pytest.approx([-0.1, -0.2, -0.25])
+    assert commands[:3, 0] == pytest.approx([0.0, 0.0, 0.0])
+    assert commands[:3, 1] == pytest.approx([0.2, 0.2, 0.2])
+    # Phase 2: joint_1 steps 0.1 .. 0.5 while the wrist is pinned to its target.
+    assert commands[3:, 0] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5])
+    assert commands[3:, 3] == pytest.approx([-0.25] * 5)
+    assert commands[-1][:6] == pytest.approx([0.5, 0.2, 0.0, -0.25, 0.0, 0.0])
+    # Joints with no plan (joint_2, joint_3, joint_5, joint_6) never leave their observed values.
+    assert commands[:, [1, 2, 4, 5]] == pytest.approx(np.tile([0.2, 0.0, 0.0, 0.0], (8, 1)))
+    # One planning observation, one residual check per phase, then the reset observation.
+    assert drv.observation_reads == 1 + 2 + 1
+    # Paced at control_hz after every command (the fake clock never advances).
+    assert sleeps == pytest.approx([STEP] * 8)
+
+
+def test_start_joints_glide_holds_the_gripper_at_its_observed_value() -> None:
+    start = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.7])
+    cfg = DK1Config(start_joints=(0.2, 0.0, 0.0, -0.1, 0.0, 0.0), max_relative_target=0.1)
+    emb, drv, _ = _build(cfg, driver=FakeDriver(state=start))
+    emb.reset(Scene(id="s", instruction="x"))
+    assert len(drv.commands) == 1 + 2
+    assert all(cmd[6] == pytest.approx(0.7) for cmd in drv.commands)
+
+
+def test_start_joints_glide_completes_against_a_motor_that_settles_short() -> None:
+    """The hardware finding: a motor 0.02 rad behind every command no longer stalls the glide.
+
+    With max_relative_target equal to the sag, the old closed-loop glide sent
+    the same pose forever. The open-loop plan still sends every planned step,
+    the residual (0.02) is steady-state sag, and no fault is raised.
+    """
+    cfg = DK1Config(start_joints=(0.1, 0.0, 0.0, -0.1, 0.0, 0.0), max_relative_target=0.02)
+    drv = SaggingDriver(sag=0.02)
+    emb, _, _ = _build(cfg, driver=drv)
+    obs = emb.reset(Scene(id="s", instruction="x"))
+
+    commands = np.stack(drv.commands)
+    assert len(commands) == 5 + 5  # ceil(0.1 / 0.02) per phase, planned, not re-observed
+    assert commands[:5, 3] == pytest.approx([-0.02, -0.04, -0.06, -0.08, -0.1])
+    assert commands[:5, 0] == pytest.approx([0.0] * 5)
+    assert commands[5:, 0] == pytest.approx([0.02, 0.04, 0.06, 0.08, 0.1])
+    assert commands[5:, 3] == pytest.approx([-0.1] * 5)  # pinned to target despite the sag
+    # The motors sit 0.02 short of both targets; that residual is accepted.
+    assert obs.state["joint_pos"][0] == pytest.approx(0.08)
+    assert obs.state["joint_pos"][3] == pytest.approx(-0.08)
+
+
+def test_start_joints_glide_goes_through_the_hard_clamp() -> None:
+    """A start pose at the joint limit arrives clamped, never above it."""
+    high = float(DK1Config().high[0])
+    cfg = DK1Config(start_joints=(high, 0.0, 0.0, 0.0, 0.0, 0.0), max_relative_target=5.0)
+    emb, drv, _ = _build(cfg)
+    emb.reset(Scene(id="s", instruction="x"))
+    assert len(drv.commands) == 1
+    assert drv.commands[0][0] == pytest.approx(high)
+
+
+@pytest.mark.parametrize(
+    ("start", "phase", "joint"),
+    [
+        ((0.0, 1.0, 0.0, 0.0, 0.0, 0.0), "phase 2 (arm, joint_1..joint_3)", "joint_2"),
+        ((0.0, 0.0, 0.0, -1.0, 0.0, 0.0), "phase 1 (wrist, joint_4..joint_6)", "joint_4"),
+    ],
+)
+def test_start_joints_glide_faults_when_a_joint_does_not_move(
+    start: tuple[float, ...], phase: str, joint: str
+) -> None:
+    """A phase whose joint stays put ends with a 1.0 rad residual and faults, naming both."""
+    cfg = DK1Config(start_joints=start, max_relative_target=0.1)
+    drv = StuckDriver(np.zeros(DIM))
+    emb, _, _ = _build(cfg, driver=drv)
+    expected = re.escape(f"start_joints glide {phase} ended with {joint} 1.000 rad from its target")
+    with pytest.raises(EmbodimentFault, match=expected):
+        emb.reset(Scene(id="s", instruction="x"))
+    # The whole 10-step plan was sent (open-loop), then the residual check faulted
+    # before any later phase could start.
+    idx = int(joint.split("_")[1]) - 1
+    sign = np.sign(start[idx])
+    assert [c[idx] for c in drv.commands] == pytest.approx([0.1 * k * sign for k in range(1, 11)])
+
+
+def test_start_joints_glide_faults_on_non_finite_observation() -> None:
+    cfg = DK1Config(start_joints=(0.0, 1.0, 0.0, 0.0, 0.0, 0.0), max_relative_target=0.1)
+    emb, _, _ = _build(cfg, driver=FakeDriver(state=np.full(DIM, np.nan)))
+    with pytest.raises(EmbodimentFault, match="non-finite"):
+        emb.reset(Scene(id="s", instruction="x"))
+
+
+def test_start_joints_from_cli_string_glides_then_homes() -> None:
+    """The CLI string reaches the embodiment through from_kwargs and drives the glide."""
+    emb = DK1Embodiment(
+        start_joints=CLI_START,
+        max_relative_target=0.5,
+        cam_height=4,
+        cam_width=4,
+        driver_factory=lambda _c: FakeDriver(),
+        operator=_operator(),
+        poll_end=lambda: False,
+        sleep_fn=lambda _d: None,
+        clock=lambda: 0.0,
+    )
+    obs = emb.reset(Scene(id="s", instruction="x"))
+    assert obs.state["joint_pos"][:6] == pytest.approx([0.0, 1.03, 1.31, -1.6, 0.0, -0.02])
+    assert obs.state["joint_pos"][6] == pytest.approx(0.0)
 
 
 def test_step_clamps_to_limits() -> None:

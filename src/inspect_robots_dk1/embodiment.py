@@ -18,6 +18,16 @@ Ported from ``inspect-robots-so101`` and built for real-robot reality:
 * **Self-paced**: declares ``SELF_PACED`` and sleeps to the control rate inside
   :meth:`step` (the framework does not pace for us). With ``settle_tolerance``
   set, ``control_hz`` is a floor on step duration rather than a fixed rate.
+* **Optional start pose**: with ``start_joints`` set, every :meth:`reset`
+  glides the six arm joints from wherever they are to the configured pose in
+  open-loop steps of ``max_relative_target`` planned from one observation
+  (through the same clamp + slew path as :meth:`step`, exactly as homing
+  does) before the operator readiness prompt, so a policy trained from a
+  raised home pose starts where its demos did. The glide runs in two ordered
+  phases, wrist (joint_4..joint_6) first and then the arm (joint_1..joint_3),
+  so the gripper is oriented before the arm descends toward the table. After
+  each phase one observation checks the residual; a joint left more than
+  ``_START_FAULT_RESIDUAL`` from its target raises ``EmbodimentFault``.
 * **No calibration step**: the DK1 plugin reports ``is_calibrated`` as always
   true and keeps no calibration file (the Damiao motors are absolute), so
   there is nothing to guard. In ``pos_vel`` mode the plugin's ``connect()``
@@ -42,6 +52,7 @@ import numpy as np
 import numpy.typing as npt
 from inspect_robots.conformance import DeviceSlot
 from inspect_robots.embodiment import SELF_PACED, EmbodimentInfo
+from inspect_robots.errors import EmbodimentFault
 from inspect_robots.scene import Scene
 from inspect_robots.types import OPERATOR_END, Action, Observation, StepResult
 
@@ -51,6 +62,7 @@ from inspect_robots_dk1.config import (
     action_box,
     observation_space,
     parse_camera_devices,
+    parse_start_joints,
 )
 from inspect_robots_dk1.operator import OperatorIO, default_poll_end
 
@@ -66,9 +78,26 @@ logger = logging.getLogger(__name__)
 #: read-bound on hardware, so this is a floor rather than a guaranteed rate.
 _SETTLE_POLL_S = 0.01
 
+#: Residual (rad) after a ``start_joints`` glide phase above which a joint is
+#: treated as physically blocked and the embodiment faults. On the real arm
+#: in impedance mode a motor settles up to a few hundredths of a radian short
+#: of every command (gravity against a soft gain); that steady-state sag is
+#: accepted, a joint stopped by an obstruction or a limit is not.
+_START_FAULT_RESIDUAL = 0.3
+
 #: Revolute-joint slots settling and slew-limiting apply to. The gripper is
 #: excluded because one closing on an object may never reach its target.
 _ARM_SLOTS = np.arange(packing.NUM_JOINTS, dtype=np.intp)
+
+#: The ordered ``start_joints`` glide phases: (label, slots that move). The
+#: wrist goes first so the gripper points the trained way before the arm
+#: descends; moving all six joints together from a raised pose brought the
+#: fingertips to the table before the wrist pitch had turned, and the wrist
+#: then stalled against the table (impedance mode yields).
+_GLIDE_PHASES: tuple[tuple[str, npt.NDArray[np.intp]], ...] = (
+    ("wrist, joint_4..joint_6", np.arange(3, packing.NUM_JOINTS, dtype=np.intp)),
+    ("arm, joint_1..joint_3", np.arange(0, 3, dtype=np.intp)),
+)
 
 _PLUGIN_INSTALL = (
     'uv pip install "lerobot_robot_trlc_dk1 @ git+https://github.com/robot-learning-co/trlc-dk1"'
@@ -244,7 +273,7 @@ class DK1Embodiment:
     # -- lifecycle ---------------------------------------------------------
 
     def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
-        """Connect (if needed), drive to home, and block on operator readiness."""
+        """Connect (if needed), glide to start_joints, home, and block on operator readiness."""
         # Clear at entry because the home command settles below. Clearing near
         # num_steps would let one exhausted trial suppress the next reset settle.
         self.settle_timeouts = 0
@@ -252,6 +281,7 @@ class DK1Embodiment:
         self._last_state = None
         if self._driver is None:
             self._driver = self._driver_factory(self._cfg)
+        self._glide_to_start()
         self._home()
         if self._cfg.home_pose is not None:
             self._settle(np.asarray(self._cfg.home_pose, dtype=np.float64))
@@ -320,6 +350,78 @@ class DK1Embodiment:
         if self._driver is None:  # pragma: no cover - reset() always connects first
             raise RuntimeError("step() called before reset()")
         return self._driver
+
+    def _glide_to_start(self) -> None:
+        """Glide the arm joints to ``start_joints`` in two ordered open-loop phases.
+
+        Phase 1 moves the wrist (joint_4..joint_6) while joint_1..joint_3 hold
+        their observed values; phase 2 moves joint_1..joint_3 while the wrist
+        is pinned to its targets. Each phase is planned like :meth:`_home`:
+        from one observation, the setpoint trajectory for the phase's joints
+        runs to their targets in ``ceil(max |delta| / max_relative_target)``
+        equal-ratio steps of at most ``max_relative_target``, and every step
+        goes through :meth:`_send` (clamp + slew, as in :meth:`step`) with
+        ``_last_state`` set to the previous planned pose so the slew limit
+        follows the plan, the gripper held at its observed value, then paces
+        to ``control_hz``.
+
+        Open-loop on purpose: in impedance mode the wrist motor settles about
+        0.02 rad short of each command, and a closed-loop slew (observed plus
+        at most ``max_relative_target``) re-sent the pose the motor had just
+        sagged back from, so the glide never progressed. Planning from the
+        observation instead lets the setpoint lead the motor. After a phase's
+        plan, one observation measures the residual of its joints; a joint
+        more than ``_START_FAULT_RESIDUAL`` from its target (an obstruction,
+        a joint limit, a motor that is not moving) raises
+        :class:`EmbodimentFault` naming the phase and the joint. That same
+        observation plans the next phase.
+        """
+        target = parse_start_joints(self._cfg.start_joints)
+        if target is None:
+            return
+        step_limit = self._cfg.max_relative_target
+        if step_limit is None:  # pragma: no cover - DK1Config enforces this with start_joints
+            raise RuntimeError("start_joints is set but max_relative_target is None")
+        wanted = np.asarray(target, dtype=np.float64)
+        self._t_last = self._clock()
+        current = self._observe_joints_for_glide()
+        # Slots whose phase is complete; later phases pin them to their targets.
+        held: npt.NDArray[np.intp] = np.empty(0, dtype=np.intp)
+        for phase, (label, slots) in enumerate(_GLIDE_PHASES, start=1):
+            delta = wanted[slots] - current[slots]
+            n_steps = int(np.ceil(float(np.max(np.abs(delta))) / step_limit))
+            # Planned pose k: held phases at target, this phase's joints k
+            # slew steps along the way, everything else where it was observed.
+            plan = current.copy()
+            plan[held] = wanted[held]
+            for k in range(1, n_steps + 1):
+                self._last_state = plan
+                plan = plan.copy()
+                plan[slots] = current[slots] + np.clip(delta, -k * step_limit, k * step_limit)
+                self._send(plan)
+                self._pace()
+            current = self._observe_joints_for_glide()
+            residual = np.abs(current[slots] - wanted[slots])
+            if float(np.max(residual)) > _START_FAULT_RESIDUAL:
+                joint = int(slots[int(np.argmax(residual))])
+                raise EmbodimentFault(
+                    f"start_joints glide phase {phase} ({label}) ended with "
+                    f"{packing.MOTORS[joint]} {float(np.max(residual)):.3f} rad from its "
+                    f"target (more than {_START_FAULT_RESIDUAL} rad): the joint is blocked "
+                    "or the motor is not moving. Check for an obstruction or a joint "
+                    "limit, then move the arm by hand."
+                )
+            held = np.concatenate([held, slots])
+
+    def _observe_joints_for_glide(self) -> Vec:
+        """One motor observation for the glide; a non-finite reading is a fault."""
+        current = packing.from_obs_dict(self._require_driver().get_observation())
+        if not np.all(np.isfinite(current)):
+            raise EmbodimentFault(
+                f"cannot glide to start_joints: motor observation contains "
+                f"non-finite values: {current}"
+            )
+        return current
 
     def _home(self) -> None:
         """Drive to home_pose, interpolating in bounded steps of max_relative_target.

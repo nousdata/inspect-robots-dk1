@@ -1,9 +1,10 @@
 """inspect-robots-dk1: Inspect Robots adapter for the TRLC-DK1 follower + LeRobot policies.
 
-Registers two Inspect Robots components via entry points:
+Registers three Inspect Robots components via entry points:
 
 * embodiment ``dk1``: :class:`~inspect_robots_dk1.embodiment.DK1Embodiment`
 * policy ``lerobot``: :class:`~inspect_robots_dk1.policy.LeRobotPolicy`
+* policy ``dream``: :class:`~inspect_robots_dk1.dream.DreamPolicy` (Dream Labs' hosted Dream-1)
 
 so ``inspect-robots run --instruction "Put the can in the box" --policy lerobot
 --embodiment dk1`` works once both packages are installed. Use
@@ -17,6 +18,7 @@ Ported from `inspect-robots-so101 <https://github.com/robocurve/inspect-robots-s
 from __future__ import annotations
 
 from inspect_robots_dk1.config import DK1Config, LeRobotPolicyConfig
+from inspect_robots_dk1.dream import DreamAPIError, DreamPolicy, DreamPolicyConfig
 from inspect_robots_dk1.embodiment import DK1Embodiment
 from inspect_robots_dk1.operator import OperatorIO
 from inspect_robots_dk1.packing import MOTORS, STATE_KEY, TOTAL_DIM, from_obs_dict, to_action_dict
@@ -37,6 +39,9 @@ __all__ = [
     "TOTAL_DIM",
     "DK1Config",
     "DK1Embodiment",
+    "DreamAPIError",
+    "DreamPolicy",
+    "DreamPolicyConfig",
     "LeRobotPolicy",
     "LeRobotPolicyConfig",
     "OperatorIO",
